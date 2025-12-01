@@ -1,45 +1,21 @@
-"""
-ui.py
-------
-Streamlit UI components for IS 456 slab designer (one-way focused).
-This version:
-- wall thickness is a free numeric input (no dropdown)
-- exposure options extended to include Mild and Extreme
-- shows IS-456 recommended cover as info (does not override user input)
-- passes exposure to the one-way design routine
-"""
-
 import streamlit as st
+
 from .one_way import design_oneway_slab
 from .two_way import design_twoway_slab
 from .report import export_pdf, export_csv
-from .reinforcement import recommend_bars
-
-FCK_OPTIONS = [20, 25, 30, 35, 40]
-FY_OPTIONS = [415, 500]
-
-# IS recommended covers (Table 16 guidance). We display this as INFO only.
-RECOMMENDED_COVER_BY_EXPOSURE = {
-    "Mild": 20,
-    "Moderate": 30,
-    "Severe": 45,       # strict IS value (you chose option B)
-    "Very Severe": 50,
-    "Extreme": 75
-}
 
 
-def _format_candidates_text(candidates):
-    lines = []
-    for c in candidates:
-        lines.append(f"- dia {c['bar_dia_mm']} mm: spacing {c['spacing_mm']} mm, provided Ast = {c['Ast_provided_mm2_per_m']:.2f} mm²/m, ok={c['ok']}, warnings={c['warnings']}")
-    return "\n".join(lines)
+# ---------------------------------------------------------
+# Display result dictionary
+# ---------------------------------------------------------
 
-
-def display_results(result: dict, show_detailed=False):
+def display_results(result: dict):
     st.subheader("Design Output")
-    keys_to_show = {k: v for k, v in result.items() if k not in ("warnings", "detailed_steps")}
+
+    keys_to_show = {k: v for k, v in result.items() if k != "warnings"}
     st.table(keys_to_show)
 
+    # Warnings
     if result.get("warnings"):
         st.subheader("Warnings")
         for w in result["warnings"]:
@@ -47,90 +23,142 @@ def display_results(result: dict, show_detailed=False):
     else:
         st.success("No warnings.")
 
-    if show_detailed and result.get("detailed_steps"):
-        st.subheader("Detailed calculation steps")
-        for step in result["detailed_steps"]:
-            st.markdown(f"**{step.get('title', '')}**")
-            st.text(step.get("body", ""))
-            st.markdown("---")
+    # Detailed step-by-step
+    if "detailed_steps" in result:
+        with st.expander("Show step-by-step IS 456 calculation"):
+            for step in result["detailed_steps"]:
+                st.markdown(f"### {step['title']}")
+                st.markdown(step["body"])
 
+
+# ---------------------------------------------------------
+# ONE-WAY SLAB UI
+# ---------------------------------------------------------
 
 def one_way_ui():
-    st.header("One-Way Slab Design")
-
-    st.markdown("Provide inputs below. Use the 'Show detailed steps' toggle to view step-by-step calculations.")
-
-    col0, _ = st.columns([1, 3])
-    with col0:
-        show_detailed = st.checkbox("Show detailed steps", value=True)
+    st.header("One-Way Slab Design (IS 456)")
 
     col1, col2 = st.columns(2)
 
     with col1:
-        clear_span = st.number_input("Clear Span (m) (Lc)", min_value=0.5, value=4.0, step=0.1)
-        support_w = st.number_input("Support Width (m)", min_value=0.0, value=0.0, step=0.01)
-        # Wall thickness is now free numeric input (user can enter any value)
-        wall_thickness_mm = st.number_input("Wall thickness (mm) — enter any value", min_value=0.0, value=115.0, step=1.0)
-        Ld = st.number_input("Design L/d (use recommended values)", min_value=12, max_value=40, value=20)
+        span_m = st.number_input("Clear Span Lc (m)", min_value=0.5, value=4.0)
+        support_w = st.number_input("Support Width (m)", min_value=0.0, value=0.0)
+        wall_thickness = st.number_input("Wall thickness (mm)", min_value=0.0, value=115.0)
+        Ld = st.number_input("Design L/d", min_value=12, max_value=30, value=20)
 
     with col2:
-        cover = st.number_input("Nominal Cover (mm)", min_value=5, max_value=150, value=20)
-        bar_dia = st.selectbox("Main Bar Diameter (mm)", options=[8, 10, 12, 16, 20, 25], index=1)
-        fck = st.selectbox("Concrete grade, fck (MPa)", options=FCK_OPTIONS, index=1)
-        fy = st.selectbox("Steel grade, fy (MPa)", options=FY_OPTIONS, index=1)
+        cover = st.number_input("Nominal Cover (mm)", min_value=10, max_value=40, value=20)
+        bar_dia = st.number_input("Main Bar Diameter (mm)", min_value=8, max_value=25, value=10)
+        fck = st.selectbox("Concrete grade fck (MPa)", [20, 25, 30, 35, 40], index=1)
+        fy = st.selectbox("Steel grade fy (MPa)", [415, 500], index=1)
 
     st.subheader("Loads")
     col3, col4 = st.columns(2)
 
     with col3:
-        LL = st.number_input("Live Load (kN/m²)", min_value=0.0, value=3.0, step=0.1)
-        FF = st.number_input("Floor Finish (kN/m²)", min_value=0.0, value=0.5, step=0.1)
+        LL = st.number_input("Live Load (kN/m²)", min_value=0.0, value=3.0)
+        FF = st.number_input("Floor Finish (kN/m²)", min_value=0.0, value=0.5)
+
     with col4:
-        partitions = st.number_input("Partition Load (kN/m) — leave 0 to auto-calc", min_value=0.0, value=0.0, step=0.1)
-        exposure = st.selectbox("Exposure condition", options=["Mild", "Moderate", "Severe", "Very Severe", "Extreme"], index=1)
+        partitions = st.number_input("Partition Load (kN/m)", min_value=0.0, value=0.0)
 
-    # Show recommended cover as info only (do not override user input)
-    recommended_cover = RECOMMENDED_COVER_BY_EXPOSURE.get(exposure)
-    if recommended_cover is not None:
-        st.info(f"IS-456 recommended nominal cover for exposure '{exposure}': {recommended_cover} mm. (This is a suggestion only — your entered cover {cover} mm will be used.)")
-
-    # if partitions = 0, estimate based on wall thickness
-    if partitions == 0 and wall_thickness_mm > 0:
-        if wall_thickness_mm == 115:
-            partitions_est = 3.5
-        elif wall_thickness_mm == 100:
-            partitions_est = 2.5
-        elif wall_thickness_mm == 200:
-            partitions_est = 6.0
-        else:
-            # linear estimate for other thicknesses (conservative): assume 115mm -> 3.5 kN/m
-            partitions_est = (wall_thickness_mm / 115.0) * 3.5
-    else:
-        partitions_est = partitions
+    exposure = st.selectbox(
+        "Exposure Condition (for cracking & cover requirements)",
+        ["Mild", "Moderate", "Severe", "Very Severe", "Extreme"],
+        index=1
+    )
 
     if st.button("Calculate One-Way Design"):
         result = design_oneway_slab(
-            clear_span_m=clear_span,
+            span_m=span_m,
             support_width_m=support_w,
+            wall_thickness_mm=wall_thickness,
             L_div_d=Ld,
             cover_mm=cover,
             bar_dia_mm=bar_dia,
             live_load_kN_m2=LL,
             floor_finish_kN_m2=FF,
-            partitions_kN_per_m=partitions_est,
+            partitions_kN_per_m=partitions,
             fck=fck,
             fy=fy,
-            exposure=exposure,
-            wall_thickness_mm=wall_thickness_mm
+            exposure=exposure
         )
-        display_results(result, show_detailed=show_detailed)
+
+        display_results(result)
 
         st.subheader("Export")
         pdf_file = export_pdf(result)
         csv_file = export_csv(result)
+
         st.download_button("Download PDF", data=open(pdf_file, "rb"), file_name=pdf_file)
         st.download_button("Download CSV", data=open(csv_file, "rb"), file_name=csv_file)
 
+
+# ---------------------------------------------------------
+# TWO-WAY SLAB UI
+# ---------------------------------------------------------
+
+def two_way_ui():
+    st.header("Two-Way Slab Design (IS 456 Table 27 Method)")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        Lx = st.number_input("Short Span Lx (m)", min_value=0.5, value=4.0)
+        Ly = st.number_input("Long Span Ly (m)", min_value=0.5, value=5.0)
+        wall_thickness = st.number_input("Wall thickness (mm)", min_value=0.0, value=115.0)
+
+    with col2:
+        cover = st.number_input("Effective Cover (mm)", min_value=10, max_value=40, value=20)
+        fck = st.selectbox("Concrete grade fck (MPa)", [20, 25, 30, 35, 40], index=1)
+        fy = st.selectbox("Steel grade fy (MPa)", [415, 500], index=1)
+
+    st.subheader("Loads")
+    col3, col4 = st.columns(2)
+
+    with col3:
+        live_load = st.number_input("Live Load (kN/m²)", min_value=0.0, value=3.0)
+        floor_finish = st.number_input("Floor Finish (kN/m²)", min_value=0.0, value=0.5)
+
+    with col4:
+        partitions = st.number_input("Partition Load (kN/m)", min_value=0.0, value=0.0)
+
+    col5, col6 = st.columns(2)
+
+    with col5:
+        bar_x = st.number_input("Bar Diameter (X-direction)", min_value=8, max_value=25, value=10)
+
+    with col6:
+        bar_y = st.number_input("Bar Diameter (Y-direction)", min_value=8, max_value=25, value=10)
+
+    if st.button("Calculate Two-Way Design"):
+        result = design_twoway_slab(
+            Lx_m=Lx,
+            Ly_m=Ly,
+            wall_thickness_mm=wall_thickness,
+            live_load_kN_m2=live_load,
+            floor_finish_kN_m2=floor_finish,
+            partitions_kN_per_m=partitions,
+            cover_mm=cover,
+            bar_dia_x_mm=bar_x,
+            bar_dia_y_mm=bar_y,
+            fck=fck,
+            fy=fy
+        )
+
+        display_results(result)
+
+        st.subheader("Export")
+        pdf_file = export_pdf(result)
+        csv_file = export_csv(result)
+
+        st.download_button("Download PDF", data=open(pdf_file, "rb"), file_name=pdf_file)
+        st.download_button("Download CSV", data=open(csv_file, "rb"), file_name=csv_file)
+
+
+# ---------------------------------------------------------
+# MAIN APP UI
+# ---------------------------------------------------------
 
 def main_ui():
     st.sidebar.title("Slab Type")
@@ -139,4 +167,4 @@ def main_ui():
     if slab_mode == "One-Way":
         one_way_ui()
     else:
-        st.info("Two-way module not updated yet. Use one-way for now.")
+        two_way_ui()
