@@ -1,236 +1,362 @@
 """
 one_way.py
-
-Full one-way slab design workflow following the student's college / IS 456 procedure:
-1) Classification (one-way/two-way handled in UI before calling)
-2) Choose depth (IS guidance)
-3) Nominal cover (table guidance input)
-4) Effective span (Clause 22.2)
-5) Factored load
-6) Ultimate moment & shear
-7) Check for maximum depth (IS rules)
-8) Flexural reinforcement design (IS simplified stress block)
-9) Shear design (use Table 19 interpolation)
-10) Minimum reinforcement
-11) Cracking check (basic)
-12) Distribution reinforcement (basic guidance)
-13) Deflection check using digitized Fig.4 & Fig.5 (interpolation)
+----------
+One-way slab design engine following the college procedure provided:
+1) check one-way vs two-way by ly/lx
+2) depth of slab (initial and final)
+3) nominal cover (based on exposure)
+4) effective span
+5) factored load
+6) ultimate moment and shear
+7) check for maximum depth (practical limits)
+8) reinforcement area (Ast)
+9) design shear (τv vs τc) using conservative τc table (approx)
+10) minimum reinforcement
+11) cracking check (simple heuristic)
+12) distribution reinforcement (recommendation)
+13) shear stress checks (again τv vs τc)
+14) deflection check (simple L/d with placeholder for modification factors)
 """
 
-from typing import Dict, List
 import math
 
 from .constants import (
-    DEFAULT_FCK, DEFAULT_FY, MIN_REINFORCEMENT_RATIO,
-    TABLE19_FCK, TABLE19_PT, TABLE19_TAU_C,
-    FIG4_PT, FIG4_ALLOWED_LD, FIG5_ASPECT, FIG5_MODIFIER
+    DEFAULT_WIDTH,
+    MIN_REINFORCEMENT_RATIO,
+    MAX_BAR_SPACING,
+    DEFAULT_FCK,
+    DEFAULT_FY
 )
-from .helpers import (
-    effective_span_clear, slab_self_weight_mm, total_dead_load,
-    factored_load, interp1d_wrapper, m_to_mm, mm_to_m
-)
-from .reinforcement import recommend_bars, area_of_bar_mm2
 from .units import moment_kNm_to_Nmm
+from .helpers import (
+    effective_span_clear,
+    slab_self_weight,
+    total_dead_load,
+    factored_load,
+    clamp,
+    round_up
+)
+from .reinforcement import recommend_bars
 
-# ---------- Utility: small helpers ----------
-def interp_table19_tau_c(fck: float, p_t_percent: float) -> float:
-    """
-    Interpolate TABLE19_TAU_C for given fck and p_t% (percent).
-    TABLE19_FCK and TABLE19_PT are the grid axes.
-    """
-    # clamp p_t in table range
-    pt = max(min(p_t_percent, TABLE19_PT[-1]), TABLE19_PT[0])
-    # find which fck bracket
-    # linear interpolation in two steps: along PT for each row, then along fck between rows
-    # first compute tau for each fck row at p_t using interp1d
-    row_tau_at_pt = []
-    for row in TABLE19_TAU_C:
-        tau = interp1d_wrapper(TABLE19_PT, row, pt)
-        row_tau_at_pt.append(tau)
-    # now interpolate along fck axis
-    fck_clamped = max(min(fck, TABLE19_FCK[-1]), TABLE19_FCK[0])
-    tau_final = interp1d_wrapper(TABLE19_FCK, row_tau_at_pt, fck_clamped)
-    return float(tau_final)
+# ---------------------------------------------------------
+# Helper: approximate τc table (Table 19 IS 456) - conservative values
+# NOTE: These are conservative approximations. If you want exact IS table
+# numbers we can paste the table and interpolate exactly.
+# Format: (fck: (τc in N/mm2 for different percentages of steel or shear cases))
+# Here we use single values as conservative τc for typical slab (for design shear)
+# ---------------------------------------------------------
+TC_APPROX = {
+    20: 0.28,  # MPa (conservative)
+    25: 0.3,
+    30: 0.33,
+    35: 0.36,
+    40: 0.38
+}
+
+# Cracking and deflection constants (placeholders / heuristics)
+CRACKING_AST_RATIO_LIMIT = 0.002  # crude heuristic: if Ast/bd < this, cracking likely
+DISTRIBUTION_PERCENT = 0.25  # 25% of main steel as distribution (typical guideline)
 
 
-def interp_fig4_allowed_ld(p_t_percent: float, aspect_ratio: float) -> float:
+def solve_ast_from_mu(Mu_Nmm, d_mm, b_mm=1000, fck=DEFAULT_FCK, fy=DEFAULT_FY):
     """
-    Use FIG4_PT vs FIG4_ALLOWED_LD to find base allowable L/d for simply supported.
-    Then apply FIG5 modifier based on aspect_ratio to get final allowable L/d.
+    Iteratively solve Ast using IS 456 stress block (singly reinforced).
+    Returns Ast (mm2 per metre).
     """
-    base_ld = interp1d_wrapper(FIG4_PT, FIG4_ALLOWED_LD, p_t_percent)
-    # get modifier for aspect
-    mod = interp1d_wrapper(FIG5_ASPECT, FIG5_MODIFIER, aspect_ratio)
-    return base_ld * mod
+    ast = 1.0
+    step = 1.0
+    max_ast = 1_000_000.0
+    while ast < max_ast:
+        x_mm = (0.87 * fy * ast) / (0.36 * fck * b_mm)
+        if x_mm >= d_mm:
+            mu_calc = 1e18
+        else:
+            mu_calc = 0.87 * fy * ast * (d_mm - 0.42 * x_mm)
+        if mu_calc >= Mu_Nmm:
+            return ast
+        ast += step
+    return max_ast
 
-# ---------- Main solver ----------
+
 def design_oneway_slab(
-    span_m: float,
-    support_width_m: float = 0.0,
-    wall_thickness_mm: float = 115.0,
-    live_load_kN_m2: float = 3.0,
-    floor_finish_kN_m2: float = 0.5,
-    partitions_kN_per_m: float = 0.0,
-    cover_mm: float = 20.0,
-    bar_dia_mm: int = 10,
-    fck: float = DEFAULT_FCK,
-    fy: float = DEFAULT_FY,
-    design_L_div_d: float = 20.0,
-    exposure: str = "Moderate"
-) -> Dict:
-    detailed_steps: List[Dict] = []
-    warnings: List[str] = []
+    clear_span_m,
+    live_load_kN_m2=3.0,
+    floor_finish_kN_m2=0.5,
+    partitions_kN_per_m=0.0,
+    strip_width_m=DEFAULT_WIDTH / 1000.0,
+    support_width_m=0.0,
+    L_div_d=20,
+    cover_mm=20,
+    bar_dia_mm=10,
+    fck=DEFAULT_FCK,
+    fy=DEFAULT_FY,
+    exposure="Moderate"
+):
+    """
+    Implements the college procedure and returns:
+    - result dict (summary)
+    - detailed_steps list for UI (each step is dict with title & body)
+    """
 
-    # 1) Input summary
-    detailed_steps.append({"title": "Inputs summary",
-                           "body": (f"Clear span Lc = {span_m:.3f} m\n"
-                                    f"Support width = {support_width_m:.3f} m\n"
-                                    f"Wall thickness = {wall_thickness_mm:.1f} mm\n"
-                                    f"Live load = {live_load_kN_m2:.3f} kN/m², Floor finish = {floor_finish_kN_m2:.3f} kN/m²\n"
-                                    f"fck = {fck} MPa, fy = {fy} MPa\n"
-                                    f"Cover = {cover_mm} mm, bar dia = {bar_dia_mm} mm\n"
-                                    f"Design L/d chosen = {design_L_div_d} (default guidance)")})
+    detailed_steps = []
+    warnings = []
 
+    # -------------------------
+    # Step 0: Inputs summary
+    # -------------------------
+    detailed_steps.append({
+        "title": "Inputs summary",
+        "body": (
+            f"Clear span Lc = {clear_span_m:.3f} m\n"
+            f"Support width = {support_width_m:.3f} m\n"
+            f"Live load = {live_load_kN_m2:.3f} kN/m²\n"
+            f"Floor finish = {floor_finish_kN_m2:.3f} kN/m²\n"
+            f"Partition load (line) = {partitions_kN_per_m:.3f} kN/m\n"
+            f"Concrete grade fck = {fck} MPa, Steel fy = {fy} MPa\n"
+            f"Nominal cover = {cover_mm} mm, Bar dia = {bar_dia_mm} mm\n"
+            f"Exposure: {exposure}\n"
+        )
+    })
 
-    # 2) Effective span (IS 456 Clause 22.2)
-    L_eff = effective_span_clear(span_m, support_width_m)
-    detailed_steps.append({"title": "Effective span (IS 456 Clause 22.2)", "body": f"Effective span L = {L_eff:.3f} m"})
+    # -------------------------
+    # Step 1: Check one-way vs two-way
+    # -------------------------
+    # For one-way decision we need Ly & Lx; in one-way function caller we assume this is a
+    # local strip of width 1m so user should call two-way separately.
+    # For completeness, we include a ratio check if support_width provided as Ly: Lx unknown here.
+    # We record that this function assumes one-way design (caller decides).
+    detailed_steps.append({
+        "title": "One-way / Two-way check",
+        "body": "This module performs one-way slab design. Use Two-Way module separately when Ly/Lx <= 2 and slab supported on four sides."
+    })
 
-    # 3) Nominal cover / nominal depth guidance handled by user input cover_mm
-    detailed_steps.append({"title": "Nominal cover", "body": f"Nominal cover used = {cover_mm} mm (user selection/exposure={exposure})"})
+    # -------------------------
+    # Step 2 & 3: Initial depth and nominal cover based on exposure
+    # -------------------------
+    # Initial effective depth from L/d (user chosen); L/d default provided by L_div_d
+    d_initial_mm = max((clear_span_m * 1000.0) / L_div_d, 100.0)
+    detailed_steps.append({
+        "title": "Initial effective depth (from L/d)",
+        "body": f"Using L/d = {L_div_d}, initial effective depth d_initial = {d_initial_mm:.1f} mm"
+    })
 
-    # 4) Initial effective depth from L/d rule (use recommended limits as starting point)
-    d_mm = max((L_eff * 1000.0) / design_L_div_d, 100.0)  # enforce practical minimum
-    detailed_steps.append({"title": "Initial effective depth (from L/d)", "body": f"d = {d_mm:.1f} mm (L/d = {design_L_div_d})"})
-
-    # 5) Loads: self-weight (use D = d + cover + bar centroid)
-    D_mm = d_mm + cover_mm + (bar_dia_mm / 2.0)
-    self_wt_kN_per_m = slab_self_weight_mm(D_mm)  # per 1 m width
-    floor_kN_per_m = floor_finish_kN_m2 * 1.0  # per m width (user supplied per m²)
-    live_kN_per_m = live_load_kN_m2 * 1.0
-    # partition auto-calc if zero and wall_thickness provided (simple slender rule)
-    if partitions_kN_per_m <= 0.0 and wall_thickness_mm > 0:
-        # sample auto rule: 3.5 kN/m per 115 mm wall thickness (you can change later)
-        partitions_kN_per_m = (wall_thickness_mm / 115.0) * 3.5
-    dl_kN_per_m = total_dead_load(self_wt_kN_per_m, floor_kN_per_m, partitions_kN_per_m)
-    wu_kN_per_m = factored_load(dl_kN_per_m, live_kN_per_m)
-    detailed_steps.append({"title": "Loads & factored load", "body": f"D = {D_mm:.1f} mm -> self-weight = {self_wt_kN_per_m:.3f} kN/m\n"
-                                                                       f"Floor finish = {floor_kN_per_m:.3f} kN/m, Live = {live_kN_per_m:.3f} kN/m, Partitions = {partitions_kN_per_m:.3f} kN/m\n"
-                                                                       f"DL = {dl_kN_per_m:.3f} kN/m, w_u = {wu_kN_per_m:.3f} kN/m"})
-
-    # 6) Ultimate moment & shear for simply supported one-way (per metre width)
-    Mu_kN_m = (wu_kN_per_m * (L_eff ** 2)) / 8.0  # kN·m per metre
-    Vu_kN = wu_kN_per_m * L_eff / 2.0
-    Mu_Nmm = moment_kNm_to_Nmm(Mu_kN_m)
-    detailed_steps.append({"title": "Ultimate moment & shear (simple support)",
-                           "body": f"Mu = {Mu_kN_m:.4f} kN·m/m = {Mu_Nmm:.1f} N·mm; Vu (end shear) = {Vu_kN:.3f} kN"})
-
-    # 7) Check for maximum depth (practical limits) - we check whether x_neutral < d (balanced)
-    # We'll determine Ast from Mu and then verify x (neutral axis). If x >= d, indicate large required Ast.
-    # 8) Flexural design: solve for Ast using IS stress block (singly reinforced)
-    # iterate Ast until Mu_calc >= Mu_req
-    def solve_ast_from_mu(Mu_req_Nmm: float, d_mm_local: float, b_mm=1000.0, fck_local=fck, fy_local=fy) -> float:
-        ast = 1.0
-        step = 1.0
-        max_ast = 1_000_000.0
-        while ast < max_ast:
-            x_mm = (0.87 * fy_local * ast) / (0.36 * fck_local * b_mm)
-            if x_mm >= d_mm_local:
-                mu_calc = 1e18
-            else:
-                mu_calc = 0.87 * fy_local * ast * (d_mm_local - 0.42 * x_mm)
-            if mu_calc >= Mu_req_Nmm:
-                return ast
-            ast += step
-        return max_ast
-
-    ast_required = solve_ast_from_mu(Mu_Nmm, d_mm, b_mm=1000.0, fck_local=fck, fy_local=fy)
-    detailed_steps.append({"title": "Flexural design (Ast required)",
-                           "body": f"Ast_required = {ast_required:.2f} mm² per metre width"})
-
-    # 9) Shear design using Table 19 interpolation: compute tau_v and tau_c
-    # convert Vu to N and compute shear stress tau_v = Vu / (b * d)
-    b_mm = 1000.0
-    Vu_N = Vu_kN * 1000.0
-    tau_v = Vu_N / (b_mm * d_mm)  # N/mm2
-    # compute p_t (%) for use in table19
-    p_t_percent = (100.0 * ast_required) / (b_mm * d_mm)
-    tau_c = interp_table19_tau_c(fck, p_t_percent)
-    detailed_steps.append({"title": "Shear check (Table 19 interpolation)",
-                           "body": f"Vu = {Vu_kN:.3f} kN => τv = {tau_v:.4f} N/mm²\n"
-                                   f"p_t = {p_t_percent:.6f} % => τc (from Table19 interp) = {tau_c:.4f} N/mm²"})
-
-    if tau_v > tau_c:
-        warnings.append("Shear stress τv exceeds τc (Table 19). Provide shear reinforcement or increase depth.")
+    # Nominal cover recommendation based on exposure (simple mapping)
+    if exposure.lower().startswith("moder"):
+        cover_rec_mm = max(cover_mm, 20)
+    elif exposure.lower().startswith("sever"):
+        cover_rec_mm = max(cover_mm, 25)
     else:
-        detailed_steps.append({"title": "Shear result", "body": "τv ≤ τc -> no shear reinforcement required (strip check)"})
+        cover_rec_mm = max(cover_mm, 30)
 
-    # 10) Minimum reinforcement (Clause 26.5.2.1)
+    detailed_steps.append({
+        "title": "Nominal cover",
+        "body": f"Recommended nominal cover for exposure '{exposure}': {cover_rec_mm} mm (user provided: {cover_mm} mm)"
+    })
+
+    # -------------------------
+    # Step 4: Effective span (IS 456 Clause 22.2)
+    # -------------------------
+    # Effective span = min(clear_span + d, centre-to-centre)
+    centre_to_centre = clear_span_m + support_width_m
+    clear_plus_d = clear_span_m + (d_initial_mm / 1000.0)
+    L_eff = min(clear_plus_d, centre_to_centre)
+    detailed_steps.append({
+        "title": "Effective span",
+        "body": (
+            f"Centre-to-centre span = {centre_to_centre:.3f} m\n"
+            f"Clear span + d = {clear_plus_d:.3f} m\n"
+            f"Effective span (min of above) = {L_eff:.3f} m"
+        )
+    })
+
+    # Recompute depth using final effective span (iterate once)
+    d_mm = max((L_eff * 1000.0) / L_div_d, 100.0)
+    D_mm = d_mm + cover_rec_mm + (bar_dia_mm / 2.0)
+    detailed_steps.append({
+        "title": "Final effective & overall depth",
+        "body": f"Final effective depth d = {d_mm:.1f} mm; overall depth D = {D_mm:.1f} mm"
+    })
+
+    # -------------------------
+    # Step 5: Factored load
+    # -------------------------
+    self_wt_kN_per_m = slab_self_weight(D_mm) * strip_width_m
+    FF_kN_per_m = floor_finish_kN_m2 * strip_width_m
+    LL_kN_per_m = live_load_kN_m2 * strip_width_m
+    dead_load_kN_per_m = total_dead_load(self_wt_kN_per_m, FF_kN_per_m, partitions_kN_per_m)
+    wu_kN_per_m = factored_load(dead_load_kN_per_m, LL_kN_per_m)
+    detailed_steps.append({
+        "title": "Loads (per metre strip)",
+        "body": (
+            f"Self weight = {self_wt_kN_per_m:.3f} kN/m\n"
+            f"Floor finish = {FF_kN_per_m:.3f} kN/m\n"
+            f"Partitions (line) = {partitions_kN_per_m:.3f} kN/m\n"
+            f"Dead load (total) = {dead_load_kN_per_m:.3f} kN/m\n"
+            f"Factored (ultimate) w_u = 1.5*(DL+LL) = {wu_kN_per_m:.3f} kN/m"
+        )
+    })
+
+    # -------------------------
+    # Step 6: Ultimate moment and shear
+    # -------------------------
+    Mu_kN_m = wu_kN_per_m * (L_eff ** 2) / 8.0  # simply supported
+    Mu_Nmm = moment_kNm_to_Nmm(Mu_kN_m)
+    Vu_kN = wu_kN_per_m * L_eff / 2.0  # shear at support per metre
+    Vu_N = Vu_kN * 1000.0
+    detailed_steps.append({
+        "title": "Ultimate bending moment & shear",
+        "body": (
+            f"Mu = w_u * L^2 / 8 = {Mu_kN_m:.3f} kN·m per metre\n"
+            f"Vu (at support) = w_u * L / 2 = {Vu_kN:.3f} kN per metre"
+        )
+    })
+
+    # -------------------------
+    # Step 7: Maximum depth check (practical)
+    # -------------------------
+    # Practical limit: we avoid excessive depth, but IS doesn't give a simple absolute max.
+    # We'll warn if D > 500 mm (practical).
+    if D_mm > 500:
+        warnings.append(f"Overall depth D = {D_mm:.1f} mm is large (>500 mm). Consider deeper beams or alternate solution.")
+    detailed_steps.append({
+        "title": "Maximum depth check",
+        "body": f"Overall depth D = {D_mm:.1f} mm (warning if > 500 mm)."
+    })
+
+    # -------------------------
+    # Step 8: Reinforcement in slab (Ast)
+    # -------------------------
+    b_mm = 1000.0
+    ast_req = solve_ast_from_mu(Mu_Nmm, d_mm, b_mm=b_mm, fck=fck, fy=fy)
+    detailed_steps.append({
+        "title": "Required tension steel (Ast)",
+        "body": f"Ast required (per metre) = {ast_req:.2f} mm²/m"
+    })
+
+    # -------------------------
+    # Step 9: Design of shear (τv) vs τc
+    # -------------------------
+    # compute shear stress τv = Vu / (b*d) in N/mm2
+    d_eff_mm = d_mm
+    Av = b_mm * d_eff_mm  # mm2 (for 1m width)
+    tau_v = (Vu_N) / Av  # N/mm2
+    tau_c = TC_APPROX.get(fck, 0.3)  # conservative
+    detailed_steps.append({
+        "title": "Shear check (compare τv with τc)",
+        "body": (
+            f"Design shear stress τv = Vu/(b*d) = {tau_v:.4f} N/mm²\n"
+            f"Conservative τc used (approx from Table 19) for fck={fck} MPa: τc = {tau_c:.3f} N/mm²\n"
+            f"If τv > τc, provide web reinforcement / check punching/shear design."
+        )
+    })
+    if tau_v > tau_c:
+        warnings.append(f"Shear stress τv = {tau_v:.4f} N/mm² exceeds conservative τc = {tau_c:.3f} N/mm² -> Provide shear reinforcement or redesign.")
+
+    # -------------------------
+    # Step 10: Minimum reinforcement
+    # -------------------------
     ast_min = MIN_REINFORCEMENT_RATIO * b_mm * d_mm
     min_flag = False
-    if ast_required < ast_min:
-        ast_required = ast_min
+    if ast_req < ast_min:
+        ast_req = ast_min
         min_flag = True
-        warnings.append("Ast set to minimum reinforcement (IS clause).")
-    detailed_steps.append({"title": "Minimum reinforcement",
-                           "body": f"Ast_min = {ast_min:.2f} mm²/m. Applied min steel: {min_flag}"})
+        detailed_steps.append({
+            "title": "Minimum reinforcement applied",
+            "body": f"Ast required increased to minimum Ast_min = {ast_min:.2f} mm²/m"
+        })
+    else:
+        detailed_steps.append({
+            "title": "Minimum reinforcement",
+            "body": f"Ast_min = {ast_min:.2f} mm²/m; Ast_required already >= min."
+        })
 
-    # 11) Cracking check (basic) — IS suggests limits based on p_t & cover (we show indicator)
-    # A simple indicator: if p_t < 0.15% then cracking risk is higher; also exposure matters (user input)
-    p_t_percent_after = (100.0 * ast_required) / (b_mm * d_mm)
-    crack_notes = []
-    if p_t_percent_after < 0.15:
-        crack_notes.append("Low steel ratio (<0.15%): cracking likely — consider higher Ast or distribution steel.")
-    if exposure.lower() in ("severe", "very severe", "extreme"):
-        crack_notes.append(f"Severe exposure ({exposure}): increase cover or use corrosion-resistant reinforcement.")
-    if crack_notes:
-        warnings += crack_notes
-    detailed_steps.append({"title": "Cracking check (indicator)",
-                           "body": f"p_t = {p_t_percent_after:.6f} %\nNotes: {'; '.join(crack_notes) if crack_notes else 'OK (indicator)'}"})
+    # -------------------------
+    # Step 11: Cracking check (simple)
+    # -------------------------
+    # Use simple heuristic: Ast/(b*d) ratio compared to threshold.
+    ast_ratio = ast_req / (b_mm * d_mm)
+    cracking_msg = f"Ast/(b*d) = {ast_ratio:.5f}"
+    if ast_ratio < CRACKING_AST_RATIO_LIMIT:
+        cracking_msg += " -> Low steel ratio; cracking likely. Consider increasing Ast or using closer bars."
+        warnings.append("Cracking: calculated steel ratio is low — serviceability cracking may occur.")
+    detailed_steps.append({"title": "Cracking check", "body": cracking_msg})
 
-    # 12) Distribution reinforcement — provide a simple recommendation: use min steel in distribution direction
-    # IS suggests distribution reinforcement of at least 0.12% (we already enforced minimum). We'll present recommended spacing/diameter.
-    rec = recommend_bars(ast_required)
-    recommended = rec["recommended"]
-    # calculate provided Ast by chosen bar & spacing
-    bar_dia_chosen = recommended["bar_dia_mm"]
-    spacing_chosen = recommended["spacing_mm"]
-    As_single = area_of_bar_mm2(bar_dia_chosen)
-    ast_provided = As_single * (1000.0 / spacing_chosen) if spacing_chosen else 0.0
-    detailed_steps.append({"title": "Distribution / provided reinforcement",
-                           "body": f"Recommended: {bar_dia_chosen} mm @ {spacing_chosen} mm c/c -> Ast_provided = {ast_provided:.2f} mm²/m"})
+    # -------------------------
+    # Step 12: Distribution reinforcement
+    # -------------------------
+    # Recommend distribution steel = some fraction of main steel (typical)
+    dist_ast = DISTRIBUTION_PERCENT * ast_req
+    detailed_steps.append({
+        "title": "Distribution reinforcement recommendation",
+        "body": f"Recommend distribution steel (secondary direction) ≈ {DISTRIBUTION_PERCENT*100:.0f}% of main Ast = {dist_ast:.2f} mm²/m"
+    })
 
-    # 13) Deflection check using Fig.4 & Fig.5 digitized interpolation
-    # compute allowable L/d (simply supported) from Fig.4 using p_t% and apply Fig.5 aspect modifier (aspect = 1 for one-way strip)
-    allowable_L_div_d = interp_fig4_allowed_ld(p_t_percent_after, aspect_ratio=1.0)
-    computed_L_div_d = (L_eff) / (d_mm / 1000.0)
-    deflection_ok = computed_L_div_d <= allowable_L_div_d
-    detailed_steps.append({"title": "Deflection check (IS Fig.4/Fig.5 interpolation)",
-                           "body": f"Computed L/d = {computed_L_div_d:.2f}. Allowable L/d (from Fig.4/5 interp) = {allowable_L_div_d:.2f}\n"
-                                   f"Deflection OK = {deflection_ok}"})
-    if not deflection_ok:
-        warnings.append("Deflection check: L/d exceeds allowable (Fig.4/5). Increase depth or provide pre-stressing / continuity.")
+    # -------------------------
+    # Step 13: Check for shear stress again (summarized)
+    # -------------------------
+    detailed_steps.append({
+        "title": "Shear stress summary",
+        "body": f"τv = {tau_v:.4f} N/mm²; τc (approx) = {tau_c:.3f} N/mm²"
+    })
 
-    # 14) Final packaging of results
+    # -------------------------
+    # Step 14: Deflection check (simple L/d and placeholder for mod factors)
+    # -------------------------
+    ld_ratio = L_eff * 1000.0 / d_mm
+    # basic allowable (simply supported) = 20
+    allowed_basic = 20.0
+    defl_msg = f"Computed L/d = {ld_ratio:.2f}. Basic allowable (simply supported) = {allowed_basic}."
+    if ld_ratio > allowed_basic:
+        defl_msg += " L/d exceeds basic allowable. Serviceability deflection may govern."
+        warnings.append("Deflection: L/d exceeds basic allowable. Consider increasing depth or check modification factors.")
+    detailed_steps.append({"title": "Deflection (basic check)", "body": defl_msg})
+
+    # Note: If you want full IS 456 modification-factor method (Kt, Kc), we can implement next.
+
+    # -------------------------
+    # Spacing & bar selection
+    # -------------------------
+    # recommend bars using reinforcement.recommend_bars
+    recommend = recommend_bars(ast_req)
+    detailed_steps.append({
+        "title": "Bar selection candidates (recommended)",
+        "body": f"Top recommendation: {recommend['recommended']}\nAll candidates: {recommend['candidates']}"
+    })
+
+    # compute spacing for the selected bar (recommended choice)
+    rec = recommend['recommended']
+    spacing_mm = rec.get("spacing_mm", None)
+    bar_dia_sel = rec.get("bar_dia_mm", None)
+    ast_provided = rec.get("Ast_provided_mm2_per_m", None)
+
+    # warnings about min spacing & max spacing already included in recommend_bars warnings
+    if not rec.get("ok", True):
+        for w in rec.get("warnings", []):
+            warnings.append(f"Bar recommendation warning: {w}")
+
+    # final packaged result
     result = {
-        "slab_type": "One-way (IS 456 method)",
+        "slab_type": "One-way (detailed procedure)",
+        "clear_span_m": round(clear_span_m, 3),
         "effective_span_m": round(L_eff, 3),
+        "cover_mm": cover_rec_mm,
         "d_mm": round(d_mm, 1),
         "D_mm": round(D_mm, 1),
+        "dead_load_kN_per_m": round(dead_load_kN_per_m, 3),
         "wu_kN_per_m": round(wu_kN_per_m, 3),
         "Mu_kN_m_per_m": round(Mu_kN_m, 3),
-        "Mu_Nmm_per_m": round(Mu_Nmm, 1),
-        "Ast_required_mm2_per_m": round(ast_required, 2),
-        "Ast_provided_mm2_per_m": round(ast_provided, 2),
-        "bar_dia_mm": bar_dia_chosen,
-        "spacing_mm": spacing_chosen,
-        "tau_v_N_per_mm2": round(tau_v, 5),
-        "tau_c_N_per_mm2": round(tau_c, 5),
-        "p_t_percent": round(p_t_percent_after, 6),
-        "allowable_L_div_d": round(allowable_L_div_d, 2),
-        "computed_L_div_d": round(computed_L_div_d, 2),
-        "deflection_ok": deflection_ok,
+        "Vu_kN_per_m": round(Vu_kN, 3),
+        "Ast_required_mm2_per_m": round(ast_req, 2),
+        "Ast_provided_mm2_per_m": round(ast_provided, 2) if ast_provided is not None else None,
+        "bar_dia_mm": int(bar_dia_sel) if bar_dia_sel is not None else None,
+        "spacing_mm": int(spacing_mm) if spacing_mm is not None else None,
+        "tau_v_N_per_mm2": round(tau_v, 4),
+        "tau_c_used_N_per_mm2": round(tau_c, 3),
+        "ld_ratio": round(ld_ratio, 2),
+        "fck": fck,
+        "fy": fy,
         "warnings": warnings,
         "detailed_steps": detailed_steps
     }
+
     return result
