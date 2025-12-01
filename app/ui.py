@@ -142,6 +142,19 @@ def two_way_ui():
         fck = st.selectbox("Concrete fck (MPa)", FCK_OPTIONS, index=1)
         fy = st.selectbox("Steel fy (MPa)", FY_OPTIONS, index=1)
 
+    # Exposure selector
+    exposure = st.selectbox(
+        "Exposure Condition (IS 456 – Table 16)",
+        list(RECOMMENDED_COVER_BY_EXPOSURE.keys()),
+        index=1
+    )
+
+    recommended_cover = RECOMMENDED_COVER_BY_EXPOSURE.get(exposure)
+    st.info(
+        f"IS 456 recommended nominal cover for '{exposure}': {recommended_cover} mm "
+        f"(this does NOT override your entered cover of {cover} mm)."
+    )
+
     st.subheader("Loads")
     col3, col4 = st.columns(2)
 
@@ -165,8 +178,11 @@ def two_way_ui():
             bar_dia_y_mm=bar_y,
             fck=fck,
             fy=fy,
-            L_div_d=Ld
+            exposure=exposure    # <--- NEW
         )
+
+        # add recommended cover to results table
+        result["recommended_cover_mm"] = recommended_cover
 
         display_results(result, show_detailed=show_detailed)
 
@@ -175,6 +191,7 @@ def two_way_ui():
         csv_file = export_csv(result)
         st.download_button("Download PDF", data=open(pdf_file, "rb"), file_name=pdf_file)
         st.download_button("Download CSV", data=open(csv_file, "rb"), file_name=csv_file)
+
 
 
 # ---------------------------------------------------------
