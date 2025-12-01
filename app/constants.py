@@ -1,59 +1,104 @@
 """
 constants.py
 -----------
-All fundamental constants used in IS 456 slab design.
-This file contains only fixed values – no functions.
+Constants and IS table data for the slab designer.
+
+Includes:
+- Material defaults and safety factors.
+- Table 27 (IS 456:2000 Annex D) alpha coefficients for two-way slabs (simply-supported on four sides).
+- An interpolation helper to get alpha_x/alpha_y for any ly/lx ratio within table range.
 """
 
-# ---------------------------------------------------------
-# MATERIAL PROPERTIES
-# ---------------------------------------------------------
-
-# Partial safety factors (IS 456:2000)
-GAMMA_F = 1.5     # Load factor for DL + LL (Limit State)
-GAMMA_M = 1.5     # Partial safety factor for steel & concrete
-
-# Unit weight of materials (kN/m³)
-UNIT_WEIGHT_CONCRETE = 25    # RCC slab self-weight
-UNIT_WEIGHT_SCREED = 20      # Floor finish screed approx.
+from typing import Tuple, List
 
 # ---------------------------------------------------------
-# GEOMETRIC LIMITS (IS 456)
+# MATERIAL PROPERTIES / GENERAL CONSTANTS
 # ---------------------------------------------------------
 
-MIN_REINFORCEMENT_RATIO = 0.0012      # For Fe500 (IS 456 Table)
-MIN_BAR_DIAMETER = 8                   # Minimum dia for slab bars
-MAX_BAR_SPACING = 300                  # Maximum spacing for slabs (mm)
+GAMMA_F = 1.5
+GAMMA_M = 1.5
+
+UNIT_WEIGHT_CONCRETE = 25.0   # kN/m3
+
+MIN_REINFORCEMENT_RATIO = 0.0012  # 0.12% for Fe500 (typical)
+MIN_BAR_DIAMETER = 8
+MAX_BAR_SPACING = 300  # mm
+
+DEFAULT_WIDTH = 1000  # mm (1 m strip)
+DEFAULT_FCK = 25
+DEFAULT_FY = 500
 
 # ---------------------------------------------------------
-# DESIGN DEFAULTS
+# IS 456:2000 - Table 27 (Bending moment coefficients) for
+# slabs spanning in two directions, simply supported on four sides.
+#
+# Columns correspond to l_y / l_x values:
+# [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.75, 2.0, 2.5, 3.0]
+#
+# Values reproduced for implementation & interpolation.
 # ---------------------------------------------------------
 
-DEFAULT_WIDTH = 1000     # 1m strip width for slab design
-EFFECTIVE_SPAN_RULE = "L + effective_depth"  # IS 456 clause 22.2
+TABLE27_LY_LX = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.75, 2.0, 2.5, 3.0]
 
-# Default materials (common practice)
-DEFAULT_FCK = 25         # M25 concrete
-DEFAULT_FY = 500         # Fe500 steel
+TABLE27_ALPHA_X = [
+    0.062,  # 1.0
+    0.074,  # 1.1
+    0.084,  # 1.2
+    0.093,  # 1.3
+    0.099,  # 1.4
+    0.104,  # 1.5
+    0.113,  # 1.75
+    0.118,  # 2.0
+    0.122,  # 2.5
+    0.124,  # 3.0
+]
+
+TABLE27_ALPHA_Y = [
+    0.062,  # 1.0
+    0.061,  # 1.1
+    0.059,  # 1.2
+    0.055,  # 1.3
+    0.051,  # 1.4
+    0.046,  # 1.5
+    0.037,  # 1.75
+    0.029,  # 2.0
+    0.020,  # 2.5
+    0.014,  # 3.0
+]
+
 
 # ---------------------------------------------------------
-# TWO-WAY SLAB COEFFICIENTS (αx, αy)
+# Utility: interpolate alpha for any ratio in table range
 # ---------------------------------------------------------
-# These are simplified typical values from IS 456 Annexure
-# Full table is large → we use main common cases.
+def interpolate_table(x_points: List[float], y_points: List[float], x: float) -> float:
+    """
+    Linear interpolation using the table points.
+    If x is outside table range, clamp to min/max.
+    """
+    if x <= x_points[0]:
+        return y_points[0]
+    if x >= x_points[-1]:
+        return y_points[-1]
 
-TWO_WAY_ALPHA = {
-    "interior": {
-        "alpha_x": 0.062,
-        "alpha_y": 0.056,
-    },
-    "edge": {
-        "alpha_x": 0.086,
-        "alpha_y": 0.052,
-    },
-    "corner": {
-        "alpha_x": 0.049,
-        "alpha_y": 0.036,
-    }
-}
+    for i in range(len(x_points) - 1):
+        x0 = x_points[i]
+        x1 = x_points[i + 1]
+        if x0 <= x <= x1:
+            y0 = y_points[i]
+            y1 = y_points[i + 1]
+            t = (x - x0) / (x1 - x0)
+            return y0 + t * (y1 - y0)
 
+    return y_points[-1]
+
+
+def get_table27_alphas(ly_lx_ratio: float) -> Tuple[float, float]:
+    """
+    Returns (alpha_x, alpha_y) for the given ly/lx ratio using Table 27 data.
+    Clamps and linearly interpolates between tabulated values.
+    Note: Table 27 is for slabs simply supported on four sides (Annex D).
+    """
+    ratio = max(min(ly_lx_ratio, TABLE27_LY_LX[-1]), TABLE27_LY_LX[0])
+    alpha_x = interpolate_table(TABLE27_LY_LX, TABLE27_ALPHA_X, ratio)
+    alpha_y = interpolate_table(TABLE27_LY_LX, TABLE27_ALPHA_Y, ratio)
+    return alpha_x, alpha_y
