@@ -46,7 +46,7 @@ def one_way_ui():
     col1, col2 = st.columns(2)
 
     with col1:
-        span_m = st.number_input("Clear Span L (m)", min_value=1.0, value=4.0)
+        clear_span = st.number_input("Clear Span (m)", min_value=1.0, value=4.0)
         support_w = st.number_input("Support Width (m)", min_value=0.0, value=0.0)
         Ld = st.number_input("L/d Ratio", min_value=12, max_value=30, value=20)
 
@@ -65,7 +65,7 @@ def one_way_ui():
 
     if st.button("Calculate One-Way Design"):
         result = design_oneway_slab(
-            span_m=span_m,
+            clear_span_m=clear_span,
             support_width_m=support_w,
             L_div_d=Ld,
             cover_mm=cover,
