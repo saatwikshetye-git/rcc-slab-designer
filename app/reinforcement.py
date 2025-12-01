@@ -1,113 +1,130 @@
 """
 reinforcement.py
------------------
-Helpers for choosing bar diameters and spacing for slab reinforcement.
-Improved candidate scoring and human-readable outputs for UI.
+
+Simple reinforcement utility functions used by one_way.py and two_way.py
+
+Provides:
+- area_of_bar_mm2(dia_mm) -> float
+- recommend_bars(ast_req_mm2_per_m, preferred_bars=[...], prefer_closer_spacing=False) -> dict
+
+The recommend_bars() implementation is conservative and self-contained:
+- computes raw spacing for each candidate bar diameter to meet Ast_required (mm^2 per m)
+- rounds spacing to a practical value (to nearest 5 mm)
+- computes Ast_provided for the rounded spacing
+- marks candidates as ok/warning based on spacing limits and Ast coverage
+- returns a "recommended" candidate (first candidate that provides >= Ast_req and has reasonable spacing),
+  otherwise returns the best available candidate (largest Ast_provided).
 """
 
 import math
-from typing import List, Dict, Tuple
+from typing import List, Dict, Optional
 
-from .constants import MIN_BAR_DIAMETER, MAX_BAR_SPACING
+# Practical spacing bounds (mm) used for basic checks
+MIN_SPACING_MM = 50    # don't allow extremely close (practical min)
+MAX_SPACING_MM = 300   # practical maximum spacing for main bars in slabs (conservative)
 
-MIN_CLEAR_SPACING = 20  # mm
-
-
-def area_of_bar(dia_mm: float) -> float:
-    return (math.pi * dia_mm * dia_mm) / 4.0
-
-
-def min_spacing_for_dia(dia_mm: float) -> float:
-    return max(1.5 * dia_mm, MIN_CLEAR_SPACING)
+def area_of_bar_mm2(dia_mm: float) -> float:
+    """Area of a circular bar in mm^2 given diameter in mm."""
+    return math.pi * (dia_mm ** 2) / 4.0
 
 
-def spacing_for_ast(ast_req_mm2_per_m: float, bar_dia_mm: float) -> float:
-    As = area_of_bar(bar_dia_mm)
-    if ast_req_mm2_per_m <= 0:
-        return float('inf')
-    spacing_mm = (As * 1000.0) / ast_req_mm2_per_m
-    return spacing_mm
-
-
-def check_spacing_rules(spacing_mm: float, bar_dia_mm: float) -> Tuple[bool, List[str]]:
-    warnings = []
-    ok = True
-
-    min_sp = min_spacing_for_dia(bar_dia_mm)
-    if spacing_mm < min_sp:
-        ok = False
-        warnings.append(f"Spacing {spacing_mm:.0f} mm < practical minimum {min_sp:.0f} mm for bar {bar_dia_mm} mm.")
-    if spacing_mm > MAX_BAR_SPACING:
-        ok = False
-        warnings.append(f"Spacing {spacing_mm:.0f} mm exceeds IS maximum {MAX_BAR_SPACING} mm.")
-    if bar_dia_mm < MIN_BAR_DIAMETER:
-        ok = False
-        warnings.append(f"Bar diameter {bar_dia_mm} mm below recommended minimum {MIN_BAR_DIAMETER} mm.")
-    return ok, warnings
+def _round_spacing_practical(spacing_mm: float) -> int:
+    """
+    Round spacing to a practical constructible value.
+    We choose nearest 5 mm for simplicity.
+    """
+    if spacing_mm is None or spacing_mm == float("inf"):
+        return None
+    return int(max(1, round(spacing_mm / 5.0) * 5))
 
 
 def recommend_bars(
     ast_req_mm2_per_m: float,
-    preferred_bars: List[int] = [8, 10, 12, 16, 20, 25],
-    prefer_closer_spacing: bool = True
+    preferred_bars: Optional[List[int]] = None,
+    prefer_closer_spacing: bool = False
 ) -> Dict:
     """
-    Return a structured dictionary with candidate list and recommended option.
-    Each candidate contains:
-      - bar_dia_mm, spacing_mm (rounded), raw_spacing_mm, Ast_provided_mm2_per_m, ok (bool), warnings (list)
-    The recommended candidate is chosen by score:
-      - ok candidates preferred
-      - spacing in practical band (80-200 mm) preferred
-      - penalize extremely close spacing (< 80 mm) moderately (construction difficulty)
-      - prefer larger diameter slightly to reduce congestion
+    Recommend bar diameter and spacing given required Ast (mm^2 per m).
+    Returns a dict with keys:
+      - recommended: {bar_dia_mm, spacing_mm, Ast_provided_mm2_per_m, ok, warnings}
+      - candidates: list of candidate dicts (same structure)
     """
+    if preferred_bars is None:
+        preferred_bars = [8, 10, 12, 16, 20, 25]
+
     candidates = []
 
+    # protect against zero/near-zero ast requirement
+    ast_req = max(ast_req_mm2_per_m or 0.0, 0.0)
+
     for dia in preferred_bars:
-        As = area_of_bar(dia)
-        raw_spacing = spacing_for_ast(ast_req_mm2_per_m, dia)
-        if raw_spacing == float('inf'):
-            spacing = float('inf')
+        area = area_of_bar_mm2(dia)  # mm2 per bar
+        if ast_req <= 0:
+            # if no steel required, place very widely spaced bars (practical default)
+            raw_spacing = 300.0
         else:
-            spacing = math.ceil(raw_spacing / 5.0) * 5
-            spacing = max(spacing, 5)
+            # number of bars per metre needed = ast_req / area
+            bars_per_m = ast_req / area
+            if bars_per_m <= 0:
+                raw_spacing = 300.0
+            else:
+                raw_spacing = 1000.0 / bars_per_m  # mm
 
-        prov_spacing = min(spacing, MAX_BAR_SPACING) if spacing != float('inf') else MAX_BAR_SPACING
-        provided_ast = As * (1000.0 / prov_spacing) if prov_spacing > 0 else 0.0
+        spacing_rounded = _round_spacing_practical(raw_spacing)
+        # avoid division by zero
+        ast_provided = (area * (1000.0 / spacing_rounded)) if spacing_rounded else 0.0
 
-        ok, warnings = check_spacing_rules(prov_spacing, dia)
+        warnings = []
+        ok = True
+
+        # check practical spacing bounds
+        if spacing_rounded is None:
+            ok = False
+            warnings.append("Invalid spacing computed.")
+        else:
+            if spacing_rounded < MIN_SPACING_MM:
+                ok = False
+                warnings.append(f"Spacing {spacing_rounded} mm < practical minimum ({MIN_SPACING_MM} mm).")
+            if spacing_rounded > MAX_SPACING_MM:
+                # treat as warn but allow (very wide spacing might be used with distribution steel)
+                warnings.append(f"Spacing {spacing_rounded} mm > recommended maximum ({MAX_SPACING_MM} mm).")
+
+        # check Ast coverage
+        if ast_provided + 1e-6 < ast_req:
+            ok = False
+            warnings.append("Provided Ast < required Ast (after rounding).")
 
         candidates.append({
-            "bar_dia_mm": int(dia),
-            "spacing_mm": int(prov_spacing) if prov_spacing != float('inf') else None,
-            "raw_spacing_mm": raw_spacing if raw_spacing != float('inf') else None,
-            "Ast_provided_mm2_per_m": round(provided_ast, 2),
+            "bar_dia_mm": dia,
+            "raw_spacing_mm": raw_spacing,
+            "spacing_mm": spacing_rounded,
+            "Ast_provided_mm2_per_m": ast_provided,
             "ok": ok,
             "warnings": warnings
         })
 
-    # scoring
-    def score(c):
-        s = 0
-        s += 100 if c["ok"] else 0
-        sp = c["spacing_mm"] or 9999
-        # ideal spacing bucket
-        if 80 <= sp <= 200:
-            s += 50
-        # avoid too close spacing
-        if sp < 80:
-            s -= 20
-        # prefer fewer bars (larger dia)
-        s += (c["bar_dia_mm"] / 5.0)
-        # penalize huge spacing (close to max)
-        if sp >= MAX_BAR_SPACING:
-            s -= 10
-        return s
+    # Choose recommended candidate:
+    # Preference: candidates that are ok and provide Ast >= required.
+    ok_candidates = [c for c in candidates if c["ok"] and c["Ast_provided_mm2_per_m"] >= ast_req - 1e-6]
+    if ok_candidates:
+        # choose the one with the largest bar dia? or with closest spacing to requirement?
+        if prefer_closer_spacing:
+            # pick candidate with smallest spacing among ok ones
+            recommended = min(ok_candidates, key=lambda c: (c["spacing_mm"] if c["spacing_mm"] else float("inf")))
+        else:
+            # choose candidate with smallest bar dia that still ok (economical)
+            recommended = sorted(ok_candidates, key=lambda c: (c["bar_dia_mm"], c["spacing_mm"]))[0]
+    else:
+        # nothing fully ok; choose candidate that gives highest Ast_provided (most conservative)
+        recommended = max(candidates, key=lambda c: c["Ast_provided_mm2_per_m"])
 
-    recommended = max(candidates, key=score)
+    # Ensure recommended has consistent fields
+    if "warnings" not in recommended:
+        recommended["warnings"] = []
+    if "ok" not in recommended:
+        recommended["ok"] = recommended["Ast_provided_mm2_per_m"] >= ast_req - 1e-6
 
     return {
-        "candidates": candidates,
         "recommended": recommended,
-        "Ast_required_mm2_per_m": round(ast_req_mm2_per_m, 2)
+        "candidates": candidates
     }
