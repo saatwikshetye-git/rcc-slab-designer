@@ -22,7 +22,6 @@ def _sanitize_for_pdf(s: str) -> str:
     if not isinstance(s, str):
         s = str(s)
 
-    # Normalize common unicode punctuation to ascii equivalents
     replacements = {
         '\u2013': '-',  # en dash
         '\u2014': '-',  # em dash
@@ -34,10 +33,7 @@ def _sanitize_for_pdf(s: str) -> str:
     for k, v in replacements.items():
         s = s.replace(k, v)
 
-    # Remove remaining non-latin1 characters safely by encoding
     s = s.encode('latin-1', 'replace').decode('latin-1')
-
-    # Collapse consecutive whitespace
     s = re.sub(r'\s+\n', '\n', s)
     return s
 
@@ -55,16 +51,11 @@ class PDFReport(FPDF):
 
 
 def export_pdf(result_dict, filename="slab_design_report.pdf"):
-    """
-    Create a simple PDF showing key results and warnings.
-    Sanitize all texts to avoid Unicode issues in FPDF.
-    """
     pdf = PDFReport()
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.set_font("Arial", size=11)
 
-    # Section: Summary
     pdf.set_font("Arial", "B", 12)
     pdf.cell(0, 10, "Design Summary", ln=True)
     pdf.set_font("Arial", size=10)
@@ -75,7 +66,6 @@ def export_pdf(result_dict, filename="slab_design_report.pdf"):
         line = f"{key}: {value}"
         pdf.multi_cell(0, 6, _sanitize_for_pdf(line))
 
-    # Warnings
     pdf.ln(4)
     pdf.set_font("Arial", "B", 12)
     pdf.cell(0, 8, "Warnings:", ln=True)
@@ -86,7 +76,6 @@ def export_pdf(result_dict, filename="slab_design_report.pdf"):
     else:
         pdf.multi_cell(0, 6, "No warnings.")
 
-    # If detailed steps present, append a concise version (not too long)
     if result_dict.get("detailed_steps"):
         pdf.add_page()
         pdf.set_font("Arial", "B", 12)
@@ -96,7 +85,6 @@ def export_pdf(result_dict, filename="slab_design_report.pdf"):
             title = _sanitize_for_pdf(step.get("title", ""))
             body = _sanitize_for_pdf(step.get("body", ""))
             pdf.multi_cell(0, 6, f"{title}")
-            # show only first 6 lines per step to avoid massive PDFs
             lines = body.splitlines()
             showing = "\n".join(lines[:6])
             pdf.multi_cell(0, 6, showing)
@@ -107,9 +95,6 @@ def export_pdf(result_dict, filename="slab_design_report.pdf"):
 
 
 def export_csv(result_dict, filename="slab_design_results.csv"):
-    """
-    Save result dictionary to CSV file. Detailed steps are appended at end.
-    """
     with open(filename, mode="w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["Parameter", "Value"])
@@ -120,14 +105,12 @@ def export_csv(result_dict, filename="slab_design_results.csv"):
                 continue
             writer.writerow([key, value])
 
-        # Warnings
         writer.writerow([])
         writer.writerow(["Warnings", ""])
         if result_dict.get("warnings"):
             for w in result_dict["warnings"]:
                 writer.writerow(["", w])
 
-        # Detailed steps appended as text (optional)
         if result_dict.get("detailed_steps"):
             writer.writerow([])
             writer.writerow(["Detailed Steps", ""])
@@ -137,4 +120,3 @@ def export_csv(result_dict, filename="slab_design_results.csv"):
                 writer.writerow([title, body])
 
     return filename
-
