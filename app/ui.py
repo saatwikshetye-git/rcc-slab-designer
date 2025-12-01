@@ -2,7 +2,6 @@
 ui.py
 ------
 Streamlit UI components for IS 456 slab designer.
-Shows alpha coefficients and ly/lx ratio for two-way (Table 27).
 """
 
 import streamlit as st
@@ -18,7 +17,7 @@ def display_results(result: dict):
     keys_to_show = {k: v for k, v in result.items() if k != "warnings"}
     st.table(keys_to_show)
 
-    # show some key values in columns for clarity
+    # Show useful metrics for two-way slabs
     if result.get("slab_type", "").lower().startswith("two-way"):
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -40,8 +39,12 @@ def display_results(result: dict):
         st.success("No warnings.")
 
 
+# ---------------------------------------------------------
+# ONE-WAY UI
+# ---------------------------------------------------------
+
 def one_way_ui():
-    st.header("One-Way Slab Design (IS 456)")
+    st.header("One-Way Slab Design")
 
     col1, col2 = st.columns(2)
 
@@ -83,9 +86,12 @@ def one_way_ui():
         st.download_button("Download CSV", data=open(csv_file, "rb"), file_name=csv_file)
 
 
+# ---------------------------------------------------------
+# TWO-WAY UI
+# ---------------------------------------------------------
+
 def two_way_ui():
-    st.header("Two-Way Slab Design (IS 456 Table 27 - Simply Supported on 4 sides)")
-    st.markdown("Two-way design uses IS 456 Table 27 (annex) coefficients interpolated for ly/lx ratio.")
+    st.header("Two-Way Slab Design")
 
     col1, col2 = st.columns(2)
 
@@ -95,7 +101,6 @@ def two_way_ui():
 
     with col2:
         cover = st.number_input("Effective Cover (mm)", min_value=10, max_value=40, value=20)
-        st.info("Using Table 27 (ly/lx interpolation). Other panel cases (Table 26) can be added later.")
 
     st.subheader("Reinforcement")
     col3, col4 = st.columns(2)
@@ -134,6 +139,10 @@ def two_way_ui():
         st.download_button("Download PDF", data=open(pdf_file, "rb"), file_name=pdf_file)
         st.download_button("Download CSV", data=open(csv_file, "rb"), file_name=csv_file)
 
+
+# ---------------------------------------------------------
+# MAIN UI ROUTER
+# ---------------------------------------------------------
 
 def main_ui():
     st.sidebar.title("Slab Type")
