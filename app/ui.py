@@ -2,27 +2,28 @@
 ui.py
 ------
 Streamlit UI components for IS 456 slab designer (one-way focused).
-This version:
-- wall thickness is a free numeric input (no dropdown)
-- exposure options extended to include Mild and Extreme
-- shows IS-456 recommended cover as info (does not override user input)
-- passes exposure to the one-way design routine
+Deflection outputs removed.
 """
 
 import streamlit as st
 from .one_way import design_oneway_slab
-from .two_way import design_twoway_slab
+# keep two-way placeholder to avoid import crash when two-way module missing/disabled
+try:
+    from .two_way import design_twoway_slab
+except Exception:
+    def design_twoway_slab(*args, **kwargs):
+        return {"msg": "Two-way slab module not implemented."}
+
 from .report import export_pdf, export_csv
 from .reinforcement import recommend_bars
 
 FCK_OPTIONS = [20, 25, 30, 35, 40]
 FY_OPTIONS = [415, 500]
 
-# IS recommended covers (Table 16 guidance). We display this as INFO only.
 RECOMMENDED_COVER_BY_EXPOSURE = {
     "Mild": 20,
     "Moderate": 30,
-    "Severe": 45,       # strict IS value (you chose option B)
+    "Severe": 45,
     "Very Severe": 50,
     "Extreme": 75
 }
@@ -57,8 +58,7 @@ def display_results(result: dict, show_detailed=False):
 
 def one_way_ui():
     st.header("One-Way Slab Design")
-
-    st.markdown("Provide inputs below. Use the 'Show detailed steps' toggle to view step-by-step calculations.")
+    st.markdown("Provide inputs below. 'Show detailed steps' toggle shows step-by-step calculations.")
 
     col0, _ = st.columns([1, 3])
     with col0:
@@ -69,9 +69,8 @@ def one_way_ui():
     with col1:
         clear_span = st.number_input("Clear Span (m) (Lc)", min_value=0.5, value=4.0, step=0.1)
         support_w = st.number_input("Support Width (m)", min_value=0.0, value=0.0, step=0.01)
-        # Wall thickness is now free numeric input (user can enter any value)
-        wall_thickness_mm = st.number_input("Wall thickness (mm) — enter any value", min_value=0.0, value=115.0, step=1.0)
-        Ld = st.number_input("Design L/d (use recommended values)", min_value=12, max_value=40, value=20)
+        wall_thickness_mm = st.number_input("Wall thickness (mm)", min_value=0.0, value=115.0, step=1.0)
+        Ld = st.number_input("Design L/d (for initial depth sizing)", min_value=12, max_value=40, value=20)
 
     with col2:
         cover = st.number_input("Nominal Cover (mm)", min_value=5, max_value=150, value=20)
@@ -89,7 +88,6 @@ def one_way_ui():
         partitions = st.number_input("Partition Load (kN/m) — leave 0 to auto-calc", min_value=0.0, value=0.0, step=0.1)
         exposure = st.selectbox("Exposure condition", options=["Mild", "Moderate", "Severe", "Very Severe", "Extreme"], index=1)
 
-    # Show recommended cover as info only (do not override user input)
     recommended_cover = RECOMMENDED_COVER_BY_EXPOSURE.get(exposure)
     if recommended_cover is not None:
         st.info(f"IS-456 recommended nominal cover for exposure '{exposure}': {recommended_cover} mm. (This is a suggestion only — your entered cover {cover} mm will be used.)")
@@ -103,7 +101,6 @@ def one_way_ui():
         elif wall_thickness_mm == 200:
             partitions_est = 6.0
         else:
-            # linear estimate for other thicknesses (conservative): assume 115mm -> 3.5 kN/m
             partitions_est = (wall_thickness_mm / 115.0) * 3.5
     else:
         partitions_est = partitions
