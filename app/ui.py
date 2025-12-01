@@ -2,24 +2,34 @@
 ui.py
 ------
 Streamlit UI components for IS 456 slab designer.
-This module only handles inputs + clean display of outputs.
+Shows alpha coefficients and ly/lx ratio for two-way (Table 27).
 """
 
 import streamlit as st
 from .one_way import design_oneway_slab
 from .two_way import design_twoway_slab
 from .report import export_pdf, export_csv
+from .reinforcement import recommend_bars
 
-
-# ---------------------------------------------------------
-# UTILITY: Display results dictionary nicely
-# ---------------------------------------------------------
 
 def display_results(result: dict):
     st.subheader("Design Output")
+    # Show main results (exclude warnings)
+    keys_to_show = {k: v for k, v in result.items() if k != "warnings"}
+    st.table(keys_to_show)
 
-    clean_dict = {k: v for k, v in result.items() if k != "warnings"}
-    st.table(clean_dict)
+    # show some key values in columns for clarity
+    if result.get("slab_type", "").lower().startswith("two-way"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("ly/lx ratio", result.get("ly_lx_ratio", "N/A"))
+            st.metric("alpha (short)", result.get("alpha_short", "N/A"))
+        with col2:
+            st.metric("alpha (long)", result.get("alpha_long", "N/A"))
+            st.metric("wu (kN/m)", result.get("wu_kN_per_m", "N/A"))
+        with col3:
+            st.metric("L short (m)", result.get("L_short_m", "N/A"))
+            st.metric("L long (m)", result.get("L_long_m", "N/A"))
 
     # Warnings
     if result.get("warnings"):
@@ -29,10 +39,6 @@ def display_results(result: dict):
     else:
         st.success("No warnings.")
 
-
-# ---------------------------------------------------------
-# ONE-WAY SLAB UI
-# ---------------------------------------------------------
 
 def one_way_ui():
     st.header("One-Way Slab Design (IS 456)")
@@ -77,12 +83,9 @@ def one_way_ui():
         st.download_button("Download CSV", data=open(csv_file, "rb"), file_name=csv_file)
 
 
-# ---------------------------------------------------------
-# TWO-WAY SLAB UI
-# ---------------------------------------------------------
-
 def two_way_ui():
-    st.header("Two-Way Slab Design (IS 456)")
+    st.header("Two-Way Slab Design (IS 456 Table 27 - Simply Supported on 4 sides)")
+    st.markdown("Two-way design uses IS 456 Table 27 (annex) coefficients interpolated for ly/lx ratio.")
 
     col1, col2 = st.columns(2)
 
@@ -92,8 +95,8 @@ def two_way_ui():
 
     with col2:
         cover = st.number_input("Effective Cover (mm)", min_value=10, max_value=40, value=20)
-        case = st.selectbox("Panel Case", ["Interior", "Edge", "Corner"])
-    
+        st.info("Using Table 27 (ly/lx interpolation). Other panel cases (Table 26) can be added later.")
+
     st.subheader("Reinforcement")
     col3, col4 = st.columns(2)
 
@@ -114,9 +117,8 @@ def two_way_ui():
 
     if st.button("Calculate Two-Way Design"):
         result = design_twoway_slab(
-            Lx_m=Lx, 
+            Lx_m=Lx,
             Ly_m=Ly,
-            panel_case=case.lower(),
             cover_mm=cover,
             bar_dia_x_mm=bar_x,
             bar_dia_y_mm=bar_y,
@@ -133,10 +135,6 @@ def two_way_ui():
         st.download_button("Download CSV", data=open(csv_file, "rb"), file_name=csv_file)
 
 
-# ---------------------------------------------------------
-# MAIN UI SELECTOR
-# ---------------------------------------------------------
-
 def main_ui():
     st.sidebar.title("Slab Type")
     slab_mode = st.sidebar.radio("Select Mode", ["One-Way", "Two-Way"])
@@ -145,4 +143,3 @@ def main_ui():
         one_way_ui()
     else:
         two_way_ui()
-
