@@ -1,9 +1,8 @@
 """
 one_way.py
 ----------
-One-way slab design engine following the college procedure.
-Minor update: accepts wall_thickness_mm and exposure; reports recommended cover (IS-456 Table 16)
-but does NOT override user cover (UI handles suggestion only).
+One-way slab design engine following common IS procedure.
+Deflection checks removed (per user request). Depth initial sizing from L/d retained.
 """
 
 import math
@@ -12,7 +11,6 @@ from typing import List, Dict
 from .constants import (
     DEFAULT_WIDTH,
     MIN_REINFORCEMENT_RATIO,
-    MAX_BAR_SPACING,
     DEFAULT_FCK,
     DEFAULT_FY
 )
@@ -27,18 +25,15 @@ from .helpers import (
 )
 from .reinforcement import recommend_bars
 
-# Recommended cover mapping per IS-456 Table 16 (used for display / reporting only)
 RECOMMENDED_COVER_BY_EXPOSURE = {
     "Mild": 20,
     "Moderate": 30,
-    "Severe": 45,       # strict IS value (user requested strict value)
+    "Severe": 45,
     "Very Severe": 50,
     "Extreme": 75
 }
 
-# ------------------------------------------------------------------
-# Helper: solve Ast for Mu (IS simplified stress block, singly reinforced)
-# ------------------------------------------------------------------
+
 def solve_ast_from_mu(Mu_Nmm: float, d_mm: float, b_mm: float = 1000.0, fck: float = DEFAULT_FCK, fy: float = DEFAULT_FY) -> float:
     ast = 1.0
     step = 1.0
@@ -55,27 +50,18 @@ def solve_ast_from_mu(Mu_Nmm: float, d_mm: float, b_mm: float = 1000.0, fck: flo
     return max_ast
 
 
-# ------------------------------------------------------------------
-# IS Table 19 τc calculation (formula-based)
-# ------------------------------------------------------------------
 def compute_tau_c_IS(fck: float, ast_mm2_per_m: float, b_mm: float, d_mm: float) -> float:
     if ast_mm2_per_m <= 0 or b_mm <= 0 or d_mm <= 0:
         return 0.0
 
     p_t = (100.0 * ast_mm2_per_m) / (b_mm * d_mm)  # percentage
-
     if p_t <= 1e-6:
         p_t = 1e-6
 
     beta = (0.8 * fck) / (6.89 * p_t)
-
-    if beta <= 1e-12:
-        factor = (math.sqrt(1.0 + 5.0 * beta) - 1.0) / (6.0 * beta) if beta != 0 else 5.0 / 12.0
-    else:
-        factor = (math.sqrt(1.0 + 5.0 * beta) - 1.0) / (6.0 * beta)
+    factor = (math.sqrt(1.0 + 5.0 * beta) - 1.0) / (6.0 * beta) if beta != 0 else 5.0 / 12.0
 
     tau_c = 0.85 * math.sqrt(0.8 * fck) * factor
-
     tau_c_max = 0.63 * math.sqrt(fck)
     if tau_c > tau_c_max:
         tau_c = tau_c_max
@@ -83,9 +69,6 @@ def compute_tau_c_IS(fck: float, ast_mm2_per_m: float, b_mm: float, d_mm: float)
     return tau_c
 
 
-# ------------------------------------------------------------------
-# Main one-way design
-# ------------------------------------------------------------------
 def design_oneway_slab(
     clear_span_m: float,
     live_load_kN_m2: float = 3.0,
@@ -104,7 +87,6 @@ def design_oneway_slab(
     detailed_steps: List[Dict] = []
     warnings: List[str] = []
 
-    # --- Step 0: inputs summary
     detailed_steps.append({
         "title": "Inputs summary",
         "body": (
@@ -120,7 +102,7 @@ def design_oneway_slab(
         )
     })
 
-    # --- Step 1: initial depth & nominal cover suggestion
+    # Initial depth estimate (L/d guidance used for sizing, not deflection check)
     d_initial_mm = max((clear_span_m * 1000.0) / L_div_d, 100.0)
     detailed_steps.append({
         "title": "Initial effective depth (from L/d)",
@@ -133,7 +115,7 @@ def design_oneway_slab(
         "body": f"Recommended nominal cover for exposure '{exposure}': {recommended_cover if recommended_cover is not None else 'N/A'} mm (user provided: {cover_mm} mm)"
     })
 
-    # --- Step 4: effective span per IS 456 clause 22.2
+    # Effective span
     centre_to_centre = clear_span_m + support_width_m
     clear_plus_d = clear_span_m + (d_initial_mm / 1000.0)
     L_eff = min(clear_plus_d, centre_to_centre)
@@ -146,7 +128,7 @@ def design_oneway_slab(
         )
     })
 
-    # recompute d using final L_eff
+    # Final d and D
     d_mm = max((L_eff * 1000.0) / L_div_d, 100.0)
     D_mm = d_mm + cover_mm + (bar_dia_mm / 2.0)
     detailed_steps.append({
@@ -154,7 +136,7 @@ def design_oneway_slab(
         "body": f"Final effective depth d = {d_mm:.1f} mm; overall depth D = {D_mm:.1f} mm"
     })
 
-    # --- Step 5: loads
+    # Loads
     self_wt_kN_per_m = slab_self_weight(D_mm) * strip_width_m
     FF_kN_per_m = floor_finish_kN_m2 * strip_width_m
     LL_kN_per_m = live_load_kN_m2 * strip_width_m
@@ -172,7 +154,7 @@ def design_oneway_slab(
         )
     })
 
-    # --- Step 6: Mu & Vu
+    # Mu & Vu
     Mu_kN_m = wu_kN_per_m * (L_eff ** 2) / 8.0
     Mu_Nmm = moment_kNm_to_Nmm(Mu_kN_m)
     Vu_kN = wu_kN_per_m * L_eff / 2.0
@@ -186,7 +168,7 @@ def design_oneway_slab(
         )
     })
 
-    # --- Step 7: max depth practical check
+    # Max depth check
     if D_mm > 500.0:
         warnings.append(f"Overall depth D = {D_mm:.1f} mm is large (>500 mm). Consider alternate solution.")
     detailed_steps.append({
@@ -194,7 +176,7 @@ def design_oneway_slab(
         "body": f"Overall depth D = {D_mm:.1f} mm (warning if > 500 mm)."
     })
 
-    # --- Step 8: Ast
+    # Ast
     b_mm = 1000.0
     ast_req = solve_ast_from_mu(Mu_Nmm, d_mm, b_mm=b_mm, fck=fck, fy=fy)
     detailed_steps.append({
@@ -202,7 +184,7 @@ def design_oneway_slab(
         "body": f"Ast required (per metre) = {ast_req:.2f} mm²/m"
     })
 
-    # --- Step 9: shear (τv vs τc)
+    # Shear
     Av_mm2 = b_mm * d_mm
     tau_v = Vu_N / Av_mm2
     tau_c_from_ast = compute_tau_c_IS(fck=fck, ast_mm2_per_m=ast_req, b_mm=b_mm, d_mm=d_mm)
@@ -221,7 +203,7 @@ def design_oneway_slab(
     else:
         detailed_steps.append({"title": "Shear adequacy", "body": "Concrete shear capacity (τc) is adequate; shear reinforcement not required by τv/τc check."})
 
-    # --- Step 10: minimum reinforcement
+    # Minimum reinforcement
     ast_min = MIN_REINFORCEMENT_RATIO * b_mm * d_mm
     if ast_req < ast_min:
         ast_req = ast_min
@@ -229,7 +211,7 @@ def design_oneway_slab(
     else:
         detailed_steps.append({"title": "Minimum reinforcement", "body": f"Ast_min = {ast_min:.2f} mm²/m; Ast_required already >= min."})
 
-    # --- Step 11: cracking (indicator)
+    # Cracking (indicator)
     ast_ratio = ast_req / (b_mm * d_mm)
     cracking_msg = f"Ast/(b*d) = {ast_ratio:.6f}"
     if ast_ratio < 0.002:
@@ -237,23 +219,11 @@ def design_oneway_slab(
         warnings.append("Cracking: steel ratio low — serviceability cracking may occur.")
     detailed_steps.append({"title": "Cracking check (indicator)", "body": cracking_msg})
 
-    # --- Step 12: distribution reinforcement
+    # Distribution steel
     dist_ast = 0.25 * ast_req
     detailed_steps.append({"title": "Distribution reinforcement recommendation", "body": f"Recommend distribution steel ≈ 25% of main Ast = {dist_ast:.2f} mm²/m"})
 
-    # --- Step 13: shear summary
-    detailed_steps.append({"title": "Shear stress summary", "body": f"τv = {tau_v:.4f} N/mm²; τc (from IS formula) = {tau_c_from_ast:.4f} N/mm²"})
-
-    # --- Step 14: deflection (basic L/d)
-    ld_ratio = (L_eff * 1000.0) / d_mm
-    allowed_basic = 20.0
-    defl_msg = f"Computed L/d = {ld_ratio:.2f}. Basic allowable (simply supported) = {allowed_basic}."
-    if ld_ratio > allowed_basic:
-        defl_msg += " L/d exceeds basic allowable. Check Fig.4/Fig.5 modification factors if required."
-        warnings.append("Deflection: L/d exceeds basic allowable. Consider increasing depth or applying Fig.4/Fig.5 modification factors.")
-    detailed_steps.append({"title": "Deflection (basic L/d check)", "body": defl_msg})
-
-    # --- Spacing & bar selection
+    # Bar selection & recommendation
     recommend = recommend_bars(ast_req, preferred_bars=[8, 10, 12, 16, 20, 25], prefer_closer_spacing=False)
     rec = recommend['recommended']
     cand_lines = []
@@ -280,7 +250,7 @@ def design_oneway_slab(
         "effective_span_m": round(L_eff, 3),
         "cover_mm_user": cover_mm,
         "recommended_cover_mm": recommended_cover,
-        "cover_override_used": False,  # UI chooses not to override
+        "cover_override_used": False,
         "wall_thickness_mm": round(wall_thickness_mm, 1),
         "d_mm": round(d_mm, 1),
         "D_mm": round(D_mm, 1),
@@ -294,7 +264,6 @@ def design_oneway_slab(
         "spacing_mm": int(spacing_mm) if spacing_mm is not None else None,
         "tau_v_N_per_mm2": round(tau_v, 4),
         "tau_c_used_N_per_mm2": round(tau_c_from_ast, 4),
-        "ld_ratio": round(ld_ratio, 2),
         "fck": fck,
         "fy": fy,
         "exposure_condition": exposure,
